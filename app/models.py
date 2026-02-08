@@ -49,6 +49,7 @@ class Activity(BaseModel):
     start_time: str
     reach_time: str
     time_to_spend: str
+    name: Optional[str] = None  # e.g. pick label in plan-with-picks
     image_url: Optional[str] = None
     google_maps_url: Optional[str] = None
 
@@ -142,3 +143,30 @@ class TripDocumentResponse(BaseModel):
     """Response: full trip document as a single string (plain text or markdown)."""
 
     content: str
+
+
+# ----- Plan from picks (single itinerary built from user picks) -----
+
+
+class PickItem(BaseModel):
+    """One pick: label and optional Google Maps link."""
+
+    label: str
+    google_maps_url: Optional[str] = None
+
+
+class PlanWithPicksRequest(BaseModel):
+    """Request body for POST /itinerary/plan-with-picks."""
+
+    picks: list[PickItem]
+    origin: Optional[str] = None
+    destination: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+
+
+class PlanWithPicksResponse(BaseModel):
+    """Response: one option built from picks, same shape as one element of /itinerary/generate options."""
+
+    option_id: str
+    option: ItineraryOption

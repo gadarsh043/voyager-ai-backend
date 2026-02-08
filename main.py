@@ -8,6 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.models import (
     ItineraryGenerateResponse,
+    PlanWithPicksRequest,
+    PlanWithPicksResponse,
     QuoteRequest,
     QuoteResponse,
     TripDocumentRequest,
@@ -15,6 +17,7 @@ from app.models import (
     TripParams,
 )
 from app.ollama_service import generate_itinerary
+from app.plan_with_picks_service import build_plan_from_picks
 from app.quote_service import build_quote
 from app.trip_document_service import TripDocumentError, generate_trip_document
 
@@ -111,3 +114,23 @@ async def trip_document(body: TripDocumentRequest):
         return await generate_trip_document(body)
     except TripDocumentError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
+
+
+@app.post(
+    "/api/itinerary/plan-with-picks",
+    response_model=PlanWithPicksResponse,
+    summary="Build one itinerary from user picks",
+)
+async def plan_with_picks_api(body: PlanWithPicksRequest):
+    """Build one full itinerary (daily_plan) from picks; same option shape as /itinerary/generate."""
+    return build_plan_from_picks(body)
+
+
+@app.post(
+    "/itinerary/plan-with-picks",
+    response_model=PlanWithPicksResponse,
+    summary="Build one itinerary from user picks (no prefix)",
+)
+async def plan_with_picks(body: PlanWithPicksRequest):
+    """Same as /api/itinerary/plan-with-picks. Body: picks (array of { label, google_maps_url? }), optional origin, destination, start_date, end_date."""
+    return build_plan_from_picks(body)
