@@ -3,6 +3,8 @@ Travel AI Backend — FastAPI app.
 POST /itinerary/generate and /api/itinerary/generate: accept trip params, return 3 itinerary options.
 """
 
+import os
+
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -27,14 +29,20 @@ app = FastAPI(
     version="0.1.0",
 )
 
+_cors_origins = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:3000",
+    "https://voyager-ai.netlify.app",
+]
+# Optional: allow more deployed UI origins via CORS_ORIGINS env
+_extra = os.environ.get("CORS_ORIGINS", "").strip()
+if _extra:
+    _cors_origins.extend(o.strip() for o in _extra.split(",") if o.strip())
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
