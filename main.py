@@ -3,12 +3,20 @@ Travel AI Backend — FastAPI app.
 POST /itinerary/generate and /api/itinerary/generate: accept trip params, return 3 itinerary options.
 """
 
-from fastapi import Body, FastAPI
+from fastapi import Body, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.models import ItineraryGenerateResponse, QuoteRequest, QuoteResponse, TripParams
+from app.models import (
+    ItineraryGenerateResponse,
+    QuoteRequest,
+    QuoteResponse,
+    TripDocumentRequest,
+    TripDocumentResponse,
+    TripParams,
+)
 from app.ollama_service import generate_itinerary
 from app.quote_service import build_quote
+from app.trip_document_service import TripDocumentError, generate_trip_document
 
 app = FastAPI(
     title="Travel AI Backend",
@@ -60,7 +68,7 @@ async def itinerary_generate(body: TripParams | None = Body(default=None)):
 
 
 @app.post(
-    "/itinerary/quote",
+    "/api/itinerary/quote",
     response_model=QuoteResponse,
     summary="In-depth quote from selected plan",
 )
@@ -72,8 +80,34 @@ async def itinerary_quote_api(body: QuoteRequest):
 @app.post(
     "/itinerary/quote",
     response_model=QuoteResponse,
-    summary="In-depth quote from selected plan (no prefix)",
+    summary="In-depth quote for selected plan (no prefix)",
 )
 async def itinerary_quote(body: QuoteRequest):
     """Same as /api/itinerary/quote. Request body: { \"option\": <selected option from /itinerary/generate> }."""
     return build_quote(body.option)
+
+
+@app.post(
+    "/api/itinerary/trip-document",
+    response_model=TripDocumentResponse,
+    summary="Generate full trip document (single AI call)",
+)
+async def trip_document_api(body: TripDocumentRequest):
+    """One AI call: itinerary, suggestions, currency, mobile, card benefits, language cheat sheet. Returns { \"content\": \"...\" }."""
+    try:
+        return await generate_trip_document(body)
+    except TripDocumentError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+
+@app.post(
+    "/itinerary/trip-document",
+    response_model=TripDocumentResponse,
+    summary="Generate full trip document (no prefix)",
+)
+async def trip_document(body: TripDocumentRequest):
+    """Same as /api/itinerary/trip-document. Frontend uses VITE_ITINERARY_API_BASE + /itinerary/trip-document."""
+    try:
+        return await generate_trip_document(body)
+    except TripDocumentError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e

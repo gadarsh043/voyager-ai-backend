@@ -115,3 +115,30 @@ class QuoteResponse(BaseModel):
     breakdown: QuoteBreakdown
     summary: QuoteSummary
     points_optimization: PointsOptimization
+
+
+# ----- Trip document (single AI-generated full document) -----
+
+
+class TripDocumentQuote(BaseModel):
+    """Quote data as sent by frontend when requesting a trip document."""
+
+    subtotal: float
+    total: float
+    breakdown: QuoteBreakdown
+    points_optimization: PointsOptimization
+
+
+class TripDocumentRequest(BaseModel):
+    """Request body for POST /itinerary/trip-document."""
+
+    option: ItineraryOption
+    quote: TripDocumentQuote
+    origin: str
+    destination: str
+
+
+class TripDocumentResponse(BaseModel):
+    """Response: full trip document as a single string (plain text or markdown)."""
+
+    content: str
