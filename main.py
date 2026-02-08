@@ -39,14 +39,41 @@ _cors_origins = [
 # Optional: allow more deployed UI origins via CORS_ORIGINS env
 _extra = os.environ.get("CORS_ORIGINS", "").strip()
 if _extra:
-    _cors_origins.extend(o.strip() for o in _extra.split(",") if o.strip())
+    _cors_origins.extend(o.strip().rstrip("/") for o in _extra.split(",") if o.strip())
+# Normalize: no trailing slash so browser Origin matches
+_cors_origins = [o.rstrip("/") for o in _cors_origins]
+_cors_origins_set = set(_cors_origins)
+
+
+async def _cors_force_middleware(request, call_next):
+    """Ensure CORS headers are on every response so preflight from Netlify/ngrok succeeds."""
+    origin = request.headers.get("origin", "").rstrip("/")
+    response = await call_next(request)
+    if origin in _cors_origins_set:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+    response.headers.setdefault("Access-Control-Allow-Credentials", "true")
+    response.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, PATCH, DELETE")
+    response.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization, ngrok-skip-browser-warning")
+    response.headers.setdefault("Access-Control-Max-Age", "86400")
+    return response
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
+app.middleware("http")(_cors_force_middleware)
+
+
+@app.options("/{full_path:path}")
+async def options_handler(full_path: str):
+    """Respond to CORS preflight for any path so Netlify + ngrok get Access-Control-* headers."""
+    return {"ok": True}
 
 
 @app.get("/")

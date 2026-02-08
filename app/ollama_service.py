@@ -72,9 +72,17 @@ Rules:
 - Activities: start_time/reach_time can be "09:00"/"09:45". time_to_spend like "1h 30m".
 - total_estimated_cost is a number (e.g. dollars).
 - You may omit optional fields (image_url, google_maps_url) or set to empty string.
+
+CRITICAL - Activities must be specific and unique:
+- Do NOT use generic labels like "Morning spot", "Afternoon exploration", "Explore", "Free time".
+- Every activity must have a specific name: real landmarks, neighborhoods, museums, markets, or named experiences (e.g. "Senso-ji Temple", "Tsukiji Outer Market", "Shibuya Crossing", "Cooking class in Shinjuku", "Dallas Arts District", "Dealey Plaza / Sixth Floor Museum").
+- Match the destination and the user's preferences (e.g. if preferences include "History", include museums or historic sites; if "Food", include a market or food tour).
+- Use the "start_from" field as the previous location (e.g. "Hotel", or the previous activity's place name). Each activity should feel like a real, thought-through stop.
 """
 
     user = f"""Generate exactly 3 itinerary options for this trip. Return only the JSON object, no other text.
+
+For every day, use SPECIFIC place names and activities for the destination—no generic "morning" or "afternoon" labels. Think like a local guide.
 
 Trip parameters: {json.dumps(p, default=str)}"""
 
@@ -167,12 +175,119 @@ def _fill_placeholder_images(response: ItineraryGenerateResponse, params: TripPa
             break
 
 
+def _destination_activities(destination: str, num_days: int, preferences: list[str] | None) -> list[list[str]]:
+    """Return one list of 3 specific activity names per day, destination-aware and unique (no generic 'morning/afternoon')."""
+    d = (destination or "").lower()
+
+    # Pool of specific activities per region; we pick 3 per day in order
+    if "tokyo" in d or "japan" in d or "osaka" in d or "kyoto" in d:
+        pool = [
+            "Senso-ji Temple (Asakusa)",
+            "Tsukiji Outer Market",
+            "Shibuya Crossing & Hachiko",
+            "teamLab Borderless",
+            "Imperial Palace East Gardens",
+            "Akihabara district",
+            "Meiji Shrine & Yoyogi Park",
+            "Shinjuku Gyoen",
+            "Roppongi Hills / Mori Art Museum",
+            "Tokyo Skytree",
+            "Ramen museum or local ramen spot",
+            "Traditional tea ceremony experience",
+        ]
+    elif "dallas" in d or "houston" in d or "texas" in d:
+        pool = [
+            "Dallas Arts District",
+            "Dealey Plaza & Sixth Floor Museum",
+            "Fort Worth Stockyards",
+            "Klyde Warren Park",
+            "Dallas Arboretum" if "dallas" in d else "Houston Museum District",
+            "Reunion Tower" if "dallas" in d else "Space Center Houston",
+            "Deep Ellum (food & murals)",
+            "Bishop Arts District",
+            "George W. Bush Presidential Library" if "dallas" in d else "Buffalo Bayou Park",
+            "Local BBQ or Tex-Mex spot",
+            "Nasher Sculpture Center" if "dallas" in d else "Menil Collection",
+            "Neighborhood food tour",
+        ]
+    elif "paris" in d or "france" in d:
+        pool = [
+            "Louvre Museum",
+            "Eiffel Tower & Champ de Mars",
+            "Notre-Dame area & Île de la Cité",
+            "Montmartre & Sacré-Cœur",
+            "Musée d'Orsay",
+            "Seine river walk & Pont Alexandre III",
+            "Le Marais (markets & falafel)",
+            "Latin Quarter & Panthéon",
+            "Sainte-Chapelle",
+            "Café culture & pastry stop",
+            "Palace of Versailles (if day trip)",
+            "Local wine & cheese tasting",
+        ]
+    elif "london" in d or "uk" in d:
+        pool = [
+            "British Museum",
+            "Tower of London & Tower Bridge",
+            "Westminster & Big Ben",
+            "Hyde Park & Kensington Gardens",
+            "Camden Market",
+            "Natural History Museum",
+            "South Bank & Tate Modern",
+            "Borough Market",
+            "Covent Garden",
+            "St Paul's Cathedral",
+            "Afternoon tea experience",
+            "West End show or walk",
+        ]
+    elif "india" in d or "hyderabad" in d or "mumbai" in d or "delhi" in d:
+        pool = [
+            "Charminar & Laad Bazaar" if "hyderabad" in d else "Historic fort or monument",
+            "Golconda Fort" if "hyderabad" in d else "Old city walk",
+            "Ramoji Film City" if "hyderabad" in d else "Local market & street food",
+            "Salar Jung Museum" if "hyderabad" in d else "Museum or palace",
+            "Hussain Sagar Lake",
+            "Birla Mandir",
+            "Traditional biryani or chai stop",
+            "Heritage walk",
+            "Craft or bazaar shopping",
+            "Temple or cultural site",
+            "Food tour (local specialties)",
+            "Gardens or park",
+        ]
+    else:
+        # Generic but still specific-sounding
+        pool = [
+            "Historic center / main square",
+            "Local market or food hall",
+            "Top museum or gallery",
+            "Famous landmark or viewpoint",
+            "Waterfront or park",
+            "Neighborhood walk & coffee",
+            "Local specialty food stop",
+            "Cultural or heritage site",
+            "Shopping street or district",
+            "Sunset or evening stroll",
+            "Guided tour (history or food)",
+            "Hidden gem recommended by locals",
+        ]
+
+    out: list[list[str]] = []
+    used = 0
+    for day in range(num_days):
+        day_activities: list[str] = []
+        for _ in range(3):
+            day_activities.append(pool[used % len(pool)])
+            used += 1
+        out.append(day_activities)
+    return out
+
+
 def _fallback_response(params: TripParams) -> ItineraryGenerateResponse:
-    """Return a valid response when Ollama fails or is unavailable. Trip-aware: uses actual dates and number of days."""
+    """Return a valid response when Ollama fails or is unavailable. Trip-aware with specific activity names."""
     def code(s: str | None, default: str) -> str:
         if not s:
             return default
-        # Use first 3 chars if looks like code, else default
         s = s.strip().upper()
         for part in s.replace(",", " ").split():
             if len(part) >= 2:
@@ -186,13 +301,11 @@ def _fallback_response(params: TripParams) -> ItineraryGenerateResponse:
     end = params.end_date or "2026-03-19"
     num_days = _num_days(start, end)
 
-    # Placeholder image and map links (so user always sees at least one image)
     hotel_image = _placeholder_image_url(f"hotel_{dest_display}")
     hotel_maps = _google_maps_url(f"Hotel {dest_display}")
     activity_image = _placeholder_image_url(f"activity_{dest_display}")
     activity_maps = _google_maps_url(f"Attractions {dest_display}")
 
-    # Budget from request (may be int/float); use for cost spread
     budget_val: float = 3000.0
     if params.budget is not None:
         try:
@@ -200,38 +313,31 @@ def _fallback_response(params: TripParams) -> ItineraryGenerateResponse:
         except (TypeError, ValueError):
             pass
 
+    day_activity_names = _destination_activities(dest_display, num_days, params.preferences)
+
     def make_days() -> list[DayPlan]:
         days_list: list[DayPlan] = []
+        slots = [(9, 0, 11, 0, "2h"), (11, 30, 13, 0, "1h 30m"), (14, 0, 17, 0, "3h")]
         for d in range(1, num_days + 1):
-            # First activity of day 1 gets image + map; others get none (at least one image in response)
-            first_activity = Activity(
-                start_from="Hotel" if d > 1 else "Airport",
-                start_time="09:00",
-                reach_time="12:00",
-                time_to_spend="2h 30m",
-                image_url=activity_image if d == 1 else None,
-                google_maps_url=activity_maps if d == 1 else None,
-            )
-            days_list.append(
-                DayPlan(
-                    day=d,
-                    activities=[
-                        first_activity,
-                        Activity(
-                            start_from="Morning spot",
-                            start_time="12:30",
-                            reach_time="13:00",
-                            time_to_spend="1h",
-                        ),
-                        Activity(
-                            start_from="Afternoon exploration",
-                            start_time="14:00",
-                            reach_time="17:00",
-                            time_to_spend="3h",
-                        ),
-                    ],
+            names = day_activity_names[d - 1] if d <= len(day_activity_names) else ["Local highlight", "Lunch & explore", "Evening in town"]
+            prev = "Hotel" if d > 1 else "Airport"
+            activities: list[Activity] = []
+            for i, name in enumerate(names):
+                if i >= len(slots):
+                    break
+                sh, sm, rh, rm, dur = slots[i]
+                act = Activity(
+                    start_from=prev,
+                    start_time=f"{sh:02d}:{sm:02d}",
+                    reach_time=f"{rh:02d}:{rm:02d}",
+                    time_to_spend=dur,
+                    name=name,
+                    image_url=activity_image if d == 1 and i == 0 else None,
+                    google_maps_url=activity_maps if d == 1 and i == 0 else None,
                 )
-            )
+                activities.append(act)
+                prev = name
+            days_list.append(DayPlan(day=d, activities=activities))
         return days_list
 
     def base_plan() -> DailyPlan:
