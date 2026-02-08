@@ -4,9 +4,13 @@ Call Ollama to generate itinerary options and map response to the API spec.
 
 import json
 import re
+from datetime import datetime
 from typing import Any
 
 import httpx
+
+# Ollama timeout: keep short so we return fallback quickly when Ollama is slow/unavailable.
+OLLAMA_TIMEOUT_SEC = 10.0
 
 from app.models import (
     Activity,
@@ -110,128 +114,108 @@ def _map_to_response(raw: dict[str, Any]) -> ItineraryGenerateResponse | None:
         return None
 
 
+def _num_days(start: str, end: str) -> int:
+    """Number of full days between start_date and end_date (inclusive). Min 1."""
+    try:
+        a = datetime.strptime(start, "%Y-%m-%d")
+        b = datetime.strptime(end, "%Y-%m-%d")
+        return max(1, (b - a).days + 1)
+    except (ValueError, TypeError):
+        return 1
+
+
 def _fallback_response(params: TripParams) -> ItineraryGenerateResponse:
-    """Return a valid minimal response when Ollama fails or is unavailable."""
-    origin = (params.origin or "SFO").upper()[:3]
-    dest = (params.destination or "Tokyo").upper()[:3]
+    """Return a valid response when Ollama fails or is unavailable. Trip-aware: uses actual dates and number of days."""
+    def code(s: str | None, default: str) -> str:
+        if not s:
+            return default
+        # Use first 3 chars if looks like code, else default
+        s = s.strip().upper()
+        for part in s.replace(",", " ").split():
+            if len(part) >= 2:
+                return part[:3]
+        return default[:3]
+
+    origin = code(params.origin, "ORIG")
+    dest = code(params.destination, "DEST")
     start = params.start_date or "2026-03-15"
     end = params.end_date or "2026-03-19"
+    num_days = _num_days(start, end)
+
+    # Budget from request (may be int/float); use for cost spread
+    budget_val: float = 3000.0
+    if params.budget is not None:
+        try:
+            budget_val = float(params.budget)
+        except (TypeError, ValueError):
+            pass
+
+    def make_days() -> list[DayPlan]:
+        return [
+            DayPlan(
+                day=d,
+                activities=[
+                    Activity(
+                        start_from="Hotel" if d > 1 else "Airport",
+                        start_time="09:00",
+                        reach_time="12:00",
+                        time_to_spend="2h 30m",
+                    ),
+                    Activity(
+                        start_from="Morning spot",
+                        start_time="12:30",
+                        reach_time="13:00",
+                        time_to_spend="1h",
+                    ),
+                    Activity(
+                        start_from="Afternoon exploration",
+                        start_time="14:00",
+                        reach_time="17:00",
+                        time_to_spend="3h",
+                    ),
+                ],
+            )
+            for d in range(1, num_days + 1)
+        ]
+
+    def base_plan() -> DailyPlan:
+        return DailyPlan(
+            flight_from_source=FlightLeg(
+                from_location=origin,
+                start_time=f"{start}T08:00:00Z",
+                reach_by=f"{start}T18:00:00Z",
+            ),
+            flight_to_origin=FlightLeg(
+                from_location=dest,
+                to_location=origin,
+                start_time=f"{end}T10:00:00Z",
+                reach_by=f"{end}T20:00:00Z",
+            ),
+            hotel_stay=[
+                HotelStay(name="Hotel", check_in=start, check_out=end),
+            ],
+            days=make_days(),
+        )
 
     return ItineraryGenerateResponse(
         options=[
             ItineraryOption(
                 id="opt_1",
                 label="Budget-friendly plan",
-                daily_plan=DailyPlan(
-                    flight_from_source=FlightLeg(
-                        from_location=origin,
-                        start_time=f"{start}T08:00:00Z",
-                        reach_by=f"{start}T18:00:00Z",
-                    ),
-                    flight_to_origin=FlightLeg(
-                        from_location=dest,
-                        to_location=origin,
-                        start_time=f"{end}T10:00:00Z",
-                        reach_by=f"{end}T20:00:00Z",
-                    ),
-                    hotel_stay=[
-                        HotelStay(
-                            name="Central Budget Hotel",
-                            check_in=start,
-                            check_out=end,
-                        )
-                    ],
-                    days=[
-                        DayPlan(
-                            day=1,
-                            activities=[
-                                Activity(
-                                    start_from="Hotel",
-                                    start_time="09:00",
-                                    reach_time="09:30",
-                                    time_to_spend="2h",
-                                )
-                            ],
-                        )
-                    ],
-                ),
-                total_estimated_cost=1200.0,
+                daily_plan=base_plan(),
+                total_estimated_cost=round(budget_val * 0.4, 0),
             ),
             ItineraryOption(
                 id="opt_2",
                 label="Balanced plan",
-                daily_plan=DailyPlan(
-                    flight_from_source=FlightLeg(
-                        from_location=origin,
-                        start_time=f"{start}T08:00:00Z",
-                        reach_by=f"{start}T18:00:00Z",
-                    ),
-                    flight_to_origin=FlightLeg(
-                        from_location=dest,
-                        to_location=origin,
-                        start_time=f"{end}T10:00:00Z",
-                        reach_by=f"{end}T20:00:00Z",
-                    ),
-                    hotel_stay=[
-                        HotelStay(
-                            name="Mid-range City Hotel",
-                            check_in=start,
-                            check_out=end,
-                        )
-                    ],
-                    days=[
-                        DayPlan(
-                            day=1,
-                            activities=[
-                                Activity(
-                                    start_from="Hotel",
-                                    start_time="09:00",
-                                    reach_time="12:00",
-                                    time_to_spend="3h",
-                                )
-                            ],
-                        )
-                    ],
-                ),
-                total_estimated_cost=2800.0,
+                daily_plan=base_plan(),
+                total_estimated_cost=round(budget_val * 0.85, 0),
             ),
             ItineraryOption(
                 id="opt_3",
                 label="Luxury plan",
-                daily_plan=DailyPlan(
-                    flight_from_source=FlightLeg(
-                        from_location=origin,
-                        start_time=f"{start}T08:00:00Z",
-                        reach_by=f"{start}T18:00:00Z",
-                    ),
-                    flight_to_origin=FlightLeg(
-                        from_location=dest,
-                        to_location=origin,
-                        start_time=f"{end}T10:00:00Z",
-                        reach_by=f"{end}T20:00:00Z",
-                    ),
-                    hotel_stay=[
-                        HotelStay(
-                            name="Luxury Resort",
-                            check_in=start,
-                            check_out=end,
-                        )
-                    ],
-                    days=[
-                        DayPlan(
-                            day=1,
-                            activities=[
-                                Activity(
-                                    start_from="Hotel",
-                                    start_time="09:00",
-                                    reach_time="17:00",
-                                    time_to_spend="Full day",
-                                )
-                            ],
-                        )
-                    ],
-                ),
-                total_estimated_cost=5500.0,
+                daily_plan=base_plan(),
+                total_estimated_cost=round(budget_val * 1.5, 0),
             ),
         ]
     )
@@ -248,7 +232,7 @@ async def generate_itinerary(params: TripParams) -> ItineraryGenerateResponse:
     system, user = _build_prompt(params)
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_SEC) as client:
             r = await client.post(
                 OLLAMA_CHAT,
                 json={
