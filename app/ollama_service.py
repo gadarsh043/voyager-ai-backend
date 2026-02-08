@@ -6,6 +6,7 @@ import json
 import re
 from datetime import datetime
 from typing import Any
+from urllib.parse import quote_plus
 
 import httpx
 
@@ -124,6 +125,48 @@ def _num_days(start: str, end: str) -> int:
         return 1
 
 
+def _placeholder_image_url(seed: str, width: int = 400, height: int = 300) -> str:
+    """Stable placeholder image via Picsum. Same seed = same image."""
+    safe = re.sub(r"[^a-z0-9]+", "", seed.lower()) or "travel"
+    return f"https://picsum.photos/seed/{safe}/{width}/{height}"
+
+
+def _google_maps_url(query: str) -> str:
+    """Google Maps search URL for a place name + location."""
+    return f"https://www.google.com/maps/search/?api=1&query={quote_plus(query)}"
+
+
+def _fill_placeholder_images(response: ItineraryGenerateResponse, params: TripParams) -> None:
+    """Ensure at least one image_url and google_maps_url in the response (mutates in place)."""
+    dest = (params.destination or "destination").strip()
+    hotel_img = _placeholder_image_url(f"hotel_{dest}")
+    hotel_maps = _google_maps_url(f"Hotel {dest}")
+    activity_img = _placeholder_image_url(f"activity_{dest}")
+    activity_maps = _google_maps_url(f"Attractions {dest}")
+    filled_activity = False
+    for opt in response.options:
+        plan = opt.daily_plan
+        if plan.hotel_stay:
+            for stay in plan.hotel_stay:
+                if not stay.image_url:
+                    stay.image_url = hotel_img
+                if not stay.google_maps_url:
+                    stay.google_maps_url = hotel_maps
+        for day in plan.days:
+            for act in day.activities:
+                if not filled_activity and (not act.image_url or not act.google_maps_url):
+                    if not act.image_url:
+                        act.image_url = activity_img
+                    if not act.google_maps_url:
+                        act.google_maps_url = activity_maps
+                    filled_activity = True
+                    break
+            if filled_activity:
+                break
+        if filled_activity:
+            break
+
+
 def _fallback_response(params: TripParams) -> ItineraryGenerateResponse:
     """Return a valid response when Ollama fails or is unavailable. Trip-aware: uses actual dates and number of days."""
     def code(s: str | None, default: str) -> str:
@@ -138,9 +181,16 @@ def _fallback_response(params: TripParams) -> ItineraryGenerateResponse:
 
     origin = code(params.origin, "ORIG")
     dest = code(params.destination, "DEST")
+    dest_display = (params.destination or "destination").strip()
     start = params.start_date or "2026-03-15"
     end = params.end_date or "2026-03-19"
     num_days = _num_days(start, end)
+
+    # Placeholder image and map links (so user always sees at least one image)
+    hotel_image = _placeholder_image_url(f"hotel_{dest_display}")
+    hotel_maps = _google_maps_url(f"Hotel {dest_display}")
+    activity_image = _placeholder_image_url(f"activity_{dest_display}")
+    activity_maps = _google_maps_url(f"Attractions {dest_display}")
 
     # Budget from request (may be int/float); use for cost spread
     budget_val: float = 3000.0
@@ -151,32 +201,38 @@ def _fallback_response(params: TripParams) -> ItineraryGenerateResponse:
             pass
 
     def make_days() -> list[DayPlan]:
-        return [
-            DayPlan(
-                day=d,
-                activities=[
-                    Activity(
-                        start_from="Hotel" if d > 1 else "Airport",
-                        start_time="09:00",
-                        reach_time="12:00",
-                        time_to_spend="2h 30m",
-                    ),
-                    Activity(
-                        start_from="Morning spot",
-                        start_time="12:30",
-                        reach_time="13:00",
-                        time_to_spend="1h",
-                    ),
-                    Activity(
-                        start_from="Afternoon exploration",
-                        start_time="14:00",
-                        reach_time="17:00",
-                        time_to_spend="3h",
-                    ),
-                ],
+        days_list: list[DayPlan] = []
+        for d in range(1, num_days + 1):
+            # First activity of day 1 gets image + map; others get none (at least one image in response)
+            first_activity = Activity(
+                start_from="Hotel" if d > 1 else "Airport",
+                start_time="09:00",
+                reach_time="12:00",
+                time_to_spend="2h 30m",
+                image_url=activity_image if d == 1 else None,
+                google_maps_url=activity_maps if d == 1 else None,
             )
-            for d in range(1, num_days + 1)
-        ]
+            days_list.append(
+                DayPlan(
+                    day=d,
+                    activities=[
+                        first_activity,
+                        Activity(
+                            start_from="Morning spot",
+                            start_time="12:30",
+                            reach_time="13:00",
+                            time_to_spend="1h",
+                        ),
+                        Activity(
+                            start_from="Afternoon exploration",
+                            start_time="14:00",
+                            reach_time="17:00",
+                            time_to_spend="3h",
+                        ),
+                    ],
+                )
+            )
+        return days_list
 
     def base_plan() -> DailyPlan:
         return DailyPlan(
@@ -192,7 +248,13 @@ def _fallback_response(params: TripParams) -> ItineraryGenerateResponse:
                 reach_by=f"{end}T20:00:00Z",
             ),
             hotel_stay=[
-                HotelStay(name="Hotel", check_in=start, check_out=end),
+                HotelStay(
+                    name="Hotel",
+                    check_in=start,
+                    check_out=end,
+                    image_url=hotel_image,
+                    google_maps_url=hotel_maps,
+                ),
             ],
             days=make_days(),
         )
@@ -264,4 +326,5 @@ async def generate_itinerary(params: TripParams) -> ItineraryGenerateResponse:
     mapped = _map_to_response(raw)
     if mapped is None:
         return _fallback_response(params)
+    _fill_placeholder_images(mapped, params)
     return mapped
