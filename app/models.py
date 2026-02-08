@@ -74,3 +74,44 @@ class ItineraryOption(BaseModel):
 
 class ItineraryGenerateResponse(BaseModel):
     options: list[ItineraryOption]
+
+
+# ----- Quote (in-depth quote from selected plan) -----
+
+
+class QuoteRequest(BaseModel):
+    """Request body for POST /itinerary/quote: the selected option from /itinerary/generate."""
+
+    option: ItineraryOption
+
+
+class BreakdownItem(BaseModel):
+    description: str
+    amount: float
+
+
+class QuoteBreakdown(BaseModel):
+    flights: list[BreakdownItem] = []
+    hotels: list[BreakdownItem] = []
+    activities: list[BreakdownItem] = []
+
+
+class QuoteSummary(BaseModel):
+    subtotal: float
+    platform_fee: float
+    total: float
+    per_person: Optional[float] = None
+
+
+class PointsOptimization(BaseModel):
+    best_card_to_use: str
+    potential_points_earned: float
+    suggestions: list[str] = []
+    transfer_partners: list[str] = []
+    redemption_tips: list[str] = []
+
+
+class QuoteResponse(BaseModel):
+    breakdown: QuoteBreakdown
+    summary: QuoteSummary
+    points_optimization: PointsOptimization

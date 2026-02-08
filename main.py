@@ -6,8 +6,9 @@ POST /itinerary/generate and /api/itinerary/generate: accept trip params, return
 from fastapi import Body, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.models import ItineraryGenerateResponse, TripParams
+from app.models import ItineraryGenerateResponse, QuoteRequest, QuoteResponse, TripParams
 from app.ollama_service import generate_itinerary
+from app.quote_service import build_quote
 
 app = FastAPI(
     title="Travel AI Backend",
@@ -56,3 +57,23 @@ async def itinerary_generate_api(body: TripParams | None = Body(default=None)):
 async def itinerary_generate(body: TripParams | None = Body(default=None)):
     """Same as /api/itinerary/generate; supports frontend calling /itinerary/generate."""
     return await _generate(body)
+
+
+@app.post(
+    "/itinerary/quote",
+    response_model=QuoteResponse,
+    summary="In-depth quote from selected plan",
+)
+async def itinerary_quote_api(body: QuoteRequest):
+    """Itemized breakdown, summary (subtotal + platform_fee = total), and points optimization."""
+    return build_quote(body.option)
+
+
+@app.post(
+    "/itinerary/quote",
+    response_model=QuoteResponse,
+    summary="In-depth quote from selected plan (no prefix)",
+)
+async def itinerary_quote(body: QuoteRequest):
+    """Same as /api/itinerary/quote. Request body: { \"option\": <selected option from /itinerary/generate> }."""
+    return build_quote(body.option)
