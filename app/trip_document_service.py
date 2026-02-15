@@ -11,7 +11,7 @@ import httpx
 
 from app.models import TripDocumentRequest, TripDocumentResponse
 
-from app.ollama_service import DEFAULT_MODEL, OLLAMA_CHAT
+from app.ollama_service import get_ollama_model, OLLAMA_CHAT
 
 # Longer timeout for full-document generation.
 DOCUMENT_TIMEOUT_SEC = 60.0
@@ -142,7 +142,7 @@ async def generate_trip_document(req: TripDocumentRequest) -> TripDocumentRespon
             r = await client.post(
                 OLLAMA_CHAT,
                 json={
-                    "model": DEFAULT_MODEL,
+                    "model": get_ollama_model(),
                     "messages": [
                         {
                             "role": "system",
