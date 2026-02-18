@@ -11,9 +11,20 @@ from urllib.parse import quote_plus
 
 import httpx
 
-# Ollama timeout: allow the model enough time (up to ~1–2 minutes)
-# to think and produce rich, well-structured itineraries before we fall back.
-OLLAMA_TIMEOUT_SEC = 90.0
+# Ollama timeout: let the model take as long as it needs. Set via env or default 5 minutes.
+def _ollama_timeout_sec() -> float:
+    try:
+        return max(60.0, float(os.environ.get("OLLAMA_TIMEOUT_SEC", "300").strip()))
+    except (ValueError, TypeError):
+        return 300.0
+
+
+class ItineraryAPIError(Exception):
+    """Raised when Ollama is unavailable or returns invalid data. Frontend should show this message, not generic data."""
+
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(message)
 
 from app.models import (
     Activity,
@@ -45,7 +56,6 @@ def _default_trip_params() -> TripParams:
         destination="Tokyo",
         start_date="2026-03-15",
         end_date="2026-03-19",
-        budget="moderate",
         preferences=["culture", "food", "sightseeing"],
     )
 
@@ -60,22 +70,26 @@ def _build_prompt(params: TripParams) -> tuple[str, str]:
 
 You respond ONLY with valid JSON (no markdown, no code fences):
 {
+  "suggested_days_for_trip": 5,
   "options": [
     {
       "id": "opt_1",
-      "label": "Short title (pace + budget)",
+      "label": "Short title (pace + cost level)",
       "daily_plan": {
-        "flight_from_source": { "from_location": "XXX", "start_time": "ISO8601", "reach_by": "ISO8601" },
-        "flight_to_origin": { "from_location": "XXX", "to_location": "XXX", "start_time": "ISO8601", "reach_by": "ISO8601" },
+        "flight_from_source": { "from_location": "XXX", "to_location": "YYY", "start_time": "ISO8601", "reach_by": "ISO8601" },
+        "flight_to_origin": { "from_location": "YYY", "to_location": "XXX", "start_time": "ISO8601", "reach_by": "ISO8601" },
         "hotel_stay": [ { "name": "Hotel Name", "check_in": "YYYY-MM-DD", "check_out": "YYYY-MM-DD", "image_url": "", "google_maps_url": "" } ],
-        "days": [ { "day": 1, "activities": [ { "start_from": "...", "name": "REAL SPECIFIC PLACE NAME", "start_time": "HH:MM", "reach_time": "HH:MM", "time_to_spend": "1h 30m" } ] } ]
+        "days": [ { "day": 1, "activities": [ { "start_from": "...", "name": "Place A", "start_time": "09:00", "reach_time": "10:30", "time_to_spend": "1h 30m" }, { "start_from": "Place A", "name": "Place B", "start_time": "11:00", "reach_time": "12:30", "time_to_spend": "1h 30m" }, { "start_from": "Place B", "name": "Place C", "start_time": "14:00", "reach_time": "17:00", "time_to_spend": "3h" } ] } ]
       },
       "total_estimated_cost": 5500
     },
-    { same for "opt_2" },
-    { same for "opt_3" }
+    { same for "opt_2" and "opt_3" }
   ]
 }
+
+MANDATORY – Multiple activities per day:
+- Each day must have 3 or 4 activities (e.g. morning, midday, afternoon, optional evening). Never output only 1 activity per day.
+- Space them realistically: start_time/reach_time in "HH:MM", time_to_spend like "1h 30m" or "2h". Chain start_from to the previous activity name.
 
 CRITICAL – Use your knowledge:
 - Draw from your training data about the destination. Use REAL place names: actual museums, markets, neighborhoods, landmarks, restaurants, parks, day-trip towns.
@@ -93,8 +107,7 @@ MANDATORY – Preferences:
 
 MANDATORY – No repeated places:
 - NEVER repeat the same place/attraction on two different days within the same option.
-- For 7 days = 21+ different places. For 4 days = 12+ different places.
-- Each day introduces NEW places only.
+- For 7 days with 3 activities/day = 21+ different places. Each day introduces NEW places only.
 
 MANDATORY – Three truly different options:
 - opt_1: Different theme + different set of places (e.g. local markets, neighborhoods, budget spots).
@@ -115,9 +128,10 @@ Other:
     user = f"""Generate exactly 3 itinerary options for this trip. Return only the JSON object, no other text.{prefs_note}
 
 Rules to follow:
+- Each day must have 3 or 4 activities (morning, midday, afternoon, optional evening). Do NOT output only one activity per day.
 - Every day in each option must list NEW places—never repeat an attraction on another day in that same option.
-- The 3 options must offer different sets of places and themes (e.g. option 1: markets & local; option 2: museums & landmarks; option 3: day trips & premium), not the same 12 places shuffled.
-- Match the user's preferences with real activities in the destination.
+- The 3 options must offer different sets of places and themes. Match the user's preferences with real activities.
+- Include "suggested_days_for_trip" at the root: your recommendation for how many days are sufficient for this destination (e.g. 4–5 for a city, 7 for a region with day trips).
 
 Trip parameters: {json.dumps(p, default=str)}"""
 
@@ -137,13 +151,17 @@ def _extract_json(text: str) -> dict[str, Any] | None:
         return None
 
 
-def _map_to_response(raw: dict[str, Any]) -> ItineraryGenerateResponse | None:
+def _map_to_response(raw: dict[str, Any], num_days_from_request: int | None = None) -> ItineraryGenerateResponse | None:
     """Map parsed JSON to Pydantic response model. Returns None if invalid."""
     try:
         options = raw.get("options")
         if not isinstance(options, list) or len(options) < 1:
             return None
-        # Ensure exactly 3 options with fixed ids
+        suggested = raw.get("suggested_days_for_trip")
+        if isinstance(suggested, (int, float)) and suggested >= 1:
+            suggested_days = int(suggested)
+        else:
+            suggested_days = num_days_from_request
         out = []
         for i, opt in enumerate(options[:3]):
             if not isinstance(opt, dict):
@@ -153,7 +171,7 @@ def _map_to_response(raw: dict[str, Any]) -> ItineraryGenerateResponse | None:
             out.append(ItineraryOption.model_validate(opt))
         if not out:
             return None
-        return ItineraryGenerateResponse(options=out)
+        return ItineraryGenerateResponse(options=out, suggested_days_for_trip=suggested_days)
     except Exception:
         return None
 
@@ -530,11 +548,15 @@ def _fallback_response(params: TripParams) -> ItineraryGenerateResponse:
     activity_maps = _google_maps_url(f"Attractions {dest_display}")
 
     budget_val: float = 3000.0
-    if params.budget is not None:
-        try:
-            budget_val = float(params.budget)
-        except (TypeError, ValueError):
-            pass
+    try:
+        pp = params.per_person_budget is not None and float(params.per_person_budget) > 0
+        nn = params.num_persons is not None and int(params.num_persons) > 0
+        if pp and nn:
+            budget_val = float(params.per_person_budget) * int(params.num_persons)
+        elif pp:
+            budget_val = float(params.per_person_budget)
+    except (TypeError, ValueError):
+        pass
 
     # Generate dynamic activity names for fallback (only used if Ollama fails)
     # Each option gets a different theme to ensure variety
@@ -617,22 +639,27 @@ def _fallback_response(params: TripParams) -> ItineraryGenerateResponse:
                 daily_plan=base_plan(day_activity_names_opt3),
                 total_estimated_cost=round(budget_val * 1.5, 0),
             ),
-        ]
+        ],
+        suggested_days_for_trip=num_days,
     )
 
 
 async def generate_itinerary(params: TripParams) -> ItineraryGenerateResponse:
     """
-    Call Ollama to generate 3 itinerary options, then validate and return the response.
-    Falls back to a minimal valid response if Ollama is unavailable or returns invalid JSON.
+    Call Ollama to generate 3 itinerary options. Raises ItineraryAPIError if Ollama
+    is unavailable, times out, or returns invalid JSON — so the frontend can show
+    "API failed" instead of generic fallback data.
     """
     if not any(params.model_dump().values()):
         params = _default_trip_params()
 
     system, user = _build_prompt(params)
+    timeout_sec = _ollama_timeout_sec()
+    # Long read timeout so Ollama has time to generate; short connect timeout for fast fail if Ollama is down
+    timeout_cfg = httpx.Timeout(10.0, read=timeout_sec)
 
     try:
-        async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_SEC) as client:
+        async with httpx.AsyncClient(timeout=timeout_cfg) as client:
             r = await client.post(
                 OLLAMA_CHAT,
                 json={
@@ -644,30 +671,49 @@ async def generate_itinerary(params: TripParams) -> ItineraryGenerateResponse:
                     "stream": False,
                     "format": "json",
                     "options": {
-                        "temperature": 0.8,  # Higher temperature = more creative/varied responses
-                        "top_p": 0.9,  # Nucleus sampling for diversity
-                        "num_predict": 4000,  # Allow longer responses for detailed itineraries
+                        "temperature": 0.8,
+                        "top_p": 0.9,
+                        "num_predict": 4000,
                     },
                 },
             )
             r.raise_for_status()
             data = r.json()
-    except (httpx.HTTPError, httpx.ConnectError, Exception):
-        return _fallback_response(params)
+    except httpx.ConnectError:
+        raise ItineraryAPIError(
+            "Itinerary API failed: cannot reach Ollama. Make sure Ollama is running (e.g. run `ollama serve` or `ollama run <model>`)."
+        )
+    except httpx.TimeoutException:
+        raise ItineraryAPIError(
+            f"Itinerary API failed: Ollama took longer than {int(timeout_sec)}s to respond. Try again or increase OLLAMA_TIMEOUT_SEC in .env (e.g. 900 for 15 min)."
+        )
+    except httpx.HTTPStatusError as e:
+        body = (e.response.text or "")[:200]
+        raise ItineraryAPIError(
+            f"Itinerary API failed: Ollama returned HTTP {e.response.status_code}. {body or 'Check that the model is pulled (ollama pull llama3.1:8b).'}"
+        )
+    except (httpx.HTTPError, Exception):
+        raise ItineraryAPIError(
+            "Itinerary API failed: Ollama returned an error. Ensure Ollama is running and the model is pulled (e.g. `ollama pull llama3.1:8b`)."
+        )
 
     content = (data.get("message") or {}).get("content") or ""
     if isinstance(content, dict):
         content = json.dumps(content)
     raw = _extract_json(content)
     if not raw:
-        # Try parsing content as-is (Ollama may return raw JSON when format=json)
         try:
             raw = json.loads(content)
         except json.JSONDecodeError:
-            return _fallback_response(params)
+            raise ItineraryAPIError(
+                "Itinerary API failed: Ollama returned invalid format. Try again or use a different model (e.g. OLLAMA_MODEL=llama3.1:8b)."
+            )
 
-    mapped = _map_to_response(raw)
+    num_days = _num_days(params.start_date or "2026-03-15", params.end_date or "2026-03-19")
+    mapped = _map_to_response(raw, num_days_from_request=num_days)
     if mapped is None:
-        return _fallback_response(params)
+        raise ItineraryAPIError(
+            "Itinerary API failed: Ollama response could not be parsed into itinerary options. Try again or use a different model."
+        )
     _fill_placeholder_images(mapped, params)
     return mapped

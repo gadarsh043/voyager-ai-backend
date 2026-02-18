@@ -12,7 +12,7 @@ pip install -r requirements.txt
 
 ## Ollama (local AI) – required for real itineraries
 
-The app uses **Ollama** to generate itineraries. If Ollama is not running or the model is missing, the API returns a fallback response (generic places).
+The app uses **Ollama** to generate itineraries. If Ollama is not running or fails, the API returns **503** with a `detail` message so the frontend can show "API failed" instead of generic data.
 
 ### 1. Install Ollama
 
@@ -66,19 +66,52 @@ uvicorn main:app --reload
 - API: `http://localhost:8000`
 - OpenAPI: `http://localhost:8000/docs`
 
-## Endpoint
+## API Endpoints
 
-- **POST /itinerary/generate**  
-  - **Body:** Trip parameters (all optional). Examples: `origin`, `destination`, `start_date`, `end_date`, `budget`, `preferences` (list of interests). Empty `{}` uses defaults (e.g. Tokyo, 3–4 days, moderate budget).  
-  - **Response:** `{ "options": [ { "id", "label", "daily_plan", "total_estimated_cost" }, ... ] }` with `daily_plan` containing `flight_from_source`, `flight_to_origin`, `hotel_stay`, `days` (see spec in repo).
+Base URL: frontend uses `VITE_ITINERARY_API_BASE` (default `http://127.0.0.1:8000`). All routes also under `/api/...` where noted.
 
-CORS is enabled for `http://localhost:5173` and `http://localhost:3000` so the React app can call the API.
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/flights/track` | Track flight by number (e.g. `{"flight_number": "UA1234"}`). Requires `AVIATION_STACK_API_KEY`. |
+| POST | `/itinerary/generate` | Generate 3 AI itinerary options. Returns **503** with a `detail` message if Ollama fails (no generic fallback). |
+| POST | `/itinerary/plan-with-picks` | Build one itinerary from user picks (labels + optional Google Maps URLs). |
+| POST | `/itinerary/quote` | Itemized quote + points optimization for a selected option. Optional `num_persons` in body. |
+| POST | `/itinerary/trip-document` | Full trip document (itinerary, currency, language, emergency contacts). |
+| GET | `/destinations` | Curated destinations for inspiration. |
+| GET | `/destinations/trending` | Trending destinations (ordered subset). |
+
+**Itinerary generate** accepts: `origin`, `destination`, `start_date`, `end_date`, `budget`, `per_person_budget`, `num_persons`, `accommodation_type`, `pace`, `preferences` (e.g. `["culture","food","nature"]`), `disability`, `dietary`. All optional.
+
+CORS is enabled for `http://localhost:5173`, `http://localhost:3000`, and `https://voyager-ai.netlify.app`. Use `ngrok-skip-browser-warning: true` header when calling behind ngrok.
 
 ---
 
 ## Building the best itinerary planner (what to do)
 
-1. **Use a capable model** – Set `OLLAMA_MODEL=llama3.1:8b` (or a larger model if you have RAM) for richer, more varied itineraries.
-2. **Keep Ollama running** – Ensure `ollama serve` or `ollama run <model>` is running so the app never falls back to generic plans.
-3. **Send clear preferences** – The more specific `origin`, `destination`, `budget`, and `preferences` (e.g. `["shopping", "food", "culture"]`) are, the better the plans.
-4. **Structured output (advanced)** – For even more reliable JSON, you can later switch to [Ollama’s structured output](https://docs.ollama.com/capabilities/structured-outputs) with a JSON schema once your API is stable.
+1. **Use a capable model** – Set `OLLAMA_MODEL=llama3.1:8b` (or a larger model if you have RAM) for richer itineraries.
+2. **Keep Ollama running** – If Ollama is down or times out, the API returns **503** with a `detail` message (e.g. "Itinerary API failed: cannot reach Ollama..."). The frontend can show that message instead of generic data.
+3. **Timeout** – Ollama can take as long as it needs; default is **5 minutes** (set `OLLAMA_TIMEOUT_SEC` in `.env`, e.g. `600` or `900` for 10–15 min). The frontend should use a **long request timeout** (e.g. 5+ minutes) when calling `/itinerary/generate`.
+4. **503 after 2–3 minutes** – Check the response body `detail` message. If you're behind **ngrok**, the free tier may close long-running requests; try calling the API directly (e.g. `http://localhost:8000`) to confirm the backend completes. If Ollama returns an error, the `detail` will include the HTTP status or snippet from Ollama.
+5. **Send clear preferences** – The more specific `origin`, `destination`, `budget`, and `preferences` are, the better the plans.
+6. **Structured output (advanced)** – For even more reliable JSON, you can later switch to [Ollama’s structured output](https://docs.ollama.com/capabilities/structured-outputs) with a JSON schema.
+
+---
+
+## Security & environment
+
+- **API keys** – Use environment variables; do not commit keys. Copy `.env.example` to `.env` and set:
+  - `AVIATION_STACK_API_KEY` – [Aviation Stack](https://aviationstack.com/signup/free) (free tier: 100 req/month) for **POST /flights/track**.
+  - Optional: `GOOGLE_MAPS_API_KEY` for Places/Geocoding; `OLLAMA_MODEL`; `OLLAMA_TIMEOUT_SEC` (seconds, default 300); `CORS_ORIGINS` (comma-separated).
+- **Validation** – All request bodies are validated via Pydantic.
+- **CORS** – Allowed origins are explicit; add more via `CORS_ORIGINS`. Header `ngrok-skip-browser-warning` is allowed for ngrok.
+
+---
+
+## Integrations checklist
+
+| Integration | Purpose | This repo |
+|-------------|---------|-----------|
+| Flight tracking | Real-time flight status | Aviation Stack (`AVIATION_STACK_API_KEY`), **POST /flights/track** |
+| Itinerary AI | Generate plans | Ollama (local), **POST /itinerary/generate** |
+| Places / Geocoding | Addresses, Maps URLs | Placeholder URLs; set `GOOGLE_MAPS_API_KEY` to enrich (optional) |
+| Destinations | Inspiration / curation | Built-in list + optional Hugging Face `DeepNLP/travel-ai-agent` (`DESTINATIONS_USE_HF=1`, `pip install datasets`) |

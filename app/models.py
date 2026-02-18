@@ -5,25 +5,94 @@ Matches the exact JSON spec for the frontend.
 
 from typing import Optional, Union
 
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel, Field
 
 
 # ----- Request -----
 
 
 class TripParams(BaseModel):
-    """Trip parameters from the frontend form. All optional; defaults used when empty."""
+    """Trip parameters from the frontend form. All optional; defaults used when empty. Use per_person_budget and num_persons for cost (no separate budget field)."""
 
     origin: Optional[str] = None
     destination: Optional[str] = None
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     date_range: Optional[str] = None
-    budget: Optional[Union[int, float, str]] = None
+    per_person_budget: Optional[Union[int, float]] = None
+    num_persons: Optional[int] = None
+    accommodation_type: Optional[str] = None  # e.g. hotel, hostel, apartment
+    pace: Optional[str] = None  # e.g. relaxed, moderate, fast
     preferences: Optional[list[str]] = None
+    disability: Optional[bool] = None
+    dietary: Optional[bool] = None
 
     class Config:
         extra = "ignore"
+
+
+# ----- Flight tracking -----
+
+
+class FlightTrackRequest(BaseModel):
+    """Request body for POST /flights/track."""
+
+    flight_number: str  # e.g. UA1234, AA456
+
+
+class FlightTrackDeparture(BaseModel):
+    airport: str
+    time: str  # ISO8601
+
+
+class FlightTrackArrival(BaseModel):
+    airport: str
+    time: str  # ISO8601
+
+
+class FlightTrackResponse(BaseModel):
+    """Response for POST /flights/track. status: scheduled, active, landed, cancelled, etc."""
+
+    status: str
+    departure: FlightTrackDeparture
+    arrival: FlightTrackArrival
+
+
+# ----- Flight search (Plan page) -----
+
+
+class FlightSearchRequest(BaseModel):
+    """Request body for POST /flights/search."""
+
+    origin: str  # city name, e.g. Houston
+    destination: str  # city name, e.g. Tokyo
+    date: str  # YYYY-MM-DD, e.g. 2026-03-15
+
+
+class FlightSearchDeparture(BaseModel):
+    airport: str
+    iata: str
+    scheduled: str  # ISO8601
+
+
+class FlightSearchArrival(BaseModel):
+    airport: str
+    iata: str
+    scheduled: str  # ISO8601
+
+
+class FlightSearchItem(BaseModel):
+    flight_iata: str
+    departure: FlightSearchDeparture
+    arrival: FlightSearchArrival
+    status: str
+
+
+class FlightSearchResponse(BaseModel):
+    flights: list[FlightSearchItem]
+    # When flights are empty, reason helps the frontend show a message and avoid retrying
+    reason: Optional[str] = None  # e.g. no_api_key, city_not_found, no_flights, invalid_date, api_error
+    message: Optional[str] = None  # Human-readable hint
 
 
 # ----- Response: nested structures -----
@@ -75,6 +144,7 @@ class ItineraryOption(BaseModel):
 
 class ItineraryGenerateResponse(BaseModel):
     options: list[ItineraryOption]
+    suggested_days_for_trip: Optional[int] = None  # LLM or backend suggestion; e.g. 5 for a short city break
 
 
 # ----- Quote (in-depth quote from selected plan) -----
@@ -84,6 +154,7 @@ class QuoteRequest(BaseModel):
     """Request body for POST /itinerary/quote: the selected option from /itinerary/generate."""
 
     option: ItineraryOption
+    num_persons: Optional[int] = None  # optional; used to compute per_person
 
 
 class BreakdownItem(BaseModel):
@@ -170,3 +241,25 @@ class PlanWithPicksResponse(BaseModel):
 
     option_id: str
     option: ItineraryOption
+
+
+# ----- Destinations (inspiration) -----
+
+
+class DestinationItem(BaseModel):
+    """Frontend expects "image" in JSON (see BACKEND_PROMPT / destinations spec)."""
+
+    id: str
+    name: str
+    country: str
+    query: str  # e.g. "Tokyo, Japan" or domain like "mindtrip.ai"
+    image_url: Optional[str] = Field(
+        None,
+        serialization_alias="image",
+        validation_alias=AliasChoices("image", "image_url"),
+    )
+    description: Optional[str] = None
+
+
+class DestinationsResponse(BaseModel):
+    destinations: list[DestinationItem]

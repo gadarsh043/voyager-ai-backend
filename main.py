@@ -1,14 +1,25 @@
 """
 Travel AI Backend — FastAPI app.
-POST /itinerary/generate and /api/itinerary/generate: accept trip params, return 3 itinerary options.
+Itinerary generation, flight tracking, destinations, quote, trip document.
 """
 
 import os
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.destinations_service import get_destinations
+from app.flight_service import search_flights, track_flight
 from app.models import (
+    DestinationsResponse,
+    FlightSearchRequest,
+    FlightSearchResponse,
+    FlightTrackRequest,
+    FlightTrackResponse,
     ItineraryGenerateResponse,
     PlanWithPicksRequest,
     PlanWithPicksResponse,
@@ -18,7 +29,7 @@ from app.models import (
     TripDocumentResponse,
     TripParams,
 )
-from app.ollama_service import generate_itinerary
+from app.ollama_service import ItineraryAPIError, generate_itinerary
 from app.plan_with_picks_service import build_plan_from_picks
 from app.quote_service import build_quote
 from app.trip_document_service import TripDocumentError, generate_trip_document
@@ -31,8 +42,10 @@ app = FastAPI(
 
 _cors_origins = [
     "http://localhost:5173",
+    "http://localhost:5174",
     "http://localhost:3000",
     "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
     "http://127.0.0.1:3000",
     "https://voyager-ai.netlify.app",
 ]
@@ -81,9 +94,95 @@ async def root():
     return {"service": "Travel AI Backend", "docs": "/docs"}
 
 
+# ----- Flight tracking -----
+
+
+@app.post(
+    "/api/flights/track",
+    response_model=FlightTrackResponse,
+    summary="Track flight by number",
+)
+async def flights_track_api(body: FlightTrackRequest):
+    """Track a flight by airline code + number (e.g. UA1234). Returns status: scheduled, active, landed, cancelled, or invalid/unavailable/not_found."""
+    return track_flight(body.flight_number)
+
+
+@app.post(
+    "/flights/track",
+    response_model=FlightTrackResponse,
+    summary="Track flight (no prefix)",
+)
+async def flights_track(body: FlightTrackRequest):
+    """Same as /api/flights/track. Body: { \"flight_number\": \"UA1234\" }."""
+    return track_flight(body.flight_number)
+
+
+@app.post(
+    "/api/flights/search",
+    response_model=FlightSearchResponse,
+    summary="Search flights for route and date",
+)
+async def flights_search_api(body: FlightSearchRequest):
+    """Search real flights by origin/destination (city names) and date. Uses Aviation Stack dep_iata/arr_iata."""
+    return search_flights(origin=body.origin, destination=body.destination, date=body.date)
+
+
+@app.post(
+    "/flights/search",
+    response_model=FlightSearchResponse,
+    summary="Search flights (no prefix)",
+)
+async def flights_search(body: FlightSearchRequest):
+    """Same as /api/flights/search. Body: { \"origin\": \"Houston\", \"destination\": \"Tokyo\", \"date\": \"2026-03-15\" }."""
+    return search_flights(origin=body.origin, destination=body.destination, date=body.date)
+
+
+# ----- Destinations (inspiration) -----
+
+
+@app.get(
+    "/api/destinations",
+    response_model=DestinationsResponse,
+    summary="List curated destinations",
+)
+async def destinations_api():
+    """Curated destinations for inspiration. Optional: seed from Hugging Face DeepNLP/travel-ai-agent via DESTINATIONS_USE_HF=1."""
+    return get_destinations(trending=False)
+
+
+@app.get(
+    "/destinations",
+    response_model=DestinationsResponse,
+    summary="List destinations (no prefix)",
+)
+async def destinations():
+    return get_destinations(trending=False)
+
+
+@app.get(
+    "/api/destinations/trending",
+    response_model=DestinationsResponse,
+    summary="Trending destinations",
+)
+async def destinations_trending_api():
+    return get_destinations(trending=True)
+
+
+@app.get(
+    "/destinations/trending",
+    response_model=DestinationsResponse,
+    summary="Trending destinations (no prefix)",
+)
+async def destinations_trending():
+    return get_destinations(trending=True)
+
+
 async def _generate(body: TripParams | None):
     params = body or TripParams()
-    return await generate_itinerary(params)
+    try:
+        return await generate_itinerary(params)
+    except ItineraryAPIError as e:
+        raise HTTPException(status_code=503, detail=e.message)
 
 
 @app.post(
@@ -101,7 +200,7 @@ async def itinerary_generate_api(body: TripParams | None = Body(default=None)):
     summary="Generate itinerary options (no prefix)",
 )
 async def itinerary_generate(body: TripParams | None = Body(default=None)):
-    """Same as /api/itinerary/generate; supports frontend calling /itinerary/generate."""
+    """Same as /api/itinerary/generate. Returns 503 with detail message if Ollama fails (no generic fallback)."""
     return await _generate(body)
 
 
@@ -111,8 +210,8 @@ async def itinerary_generate(body: TripParams | None = Body(default=None)):
     summary="In-depth quote from selected plan",
 )
 async def itinerary_quote_api(body: QuoteRequest):
-    """Itemized breakdown, summary (subtotal + platform_fee = total), and points optimization."""
-    return build_quote(body.option)
+    """Itemized breakdown, summary (subtotal + platform_fee = total), and points optimization. Optional: num_persons for per_person."""
+    return build_quote(body.option, num_persons=body.num_persons)
 
 
 @app.post(
@@ -121,8 +220,8 @@ async def itinerary_quote_api(body: QuoteRequest):
     summary="In-depth quote for selected plan (no prefix)",
 )
 async def itinerary_quote(body: QuoteRequest):
-    """Same as /api/itinerary/quote. Request body: { \"option\": <selected option from /itinerary/generate> }."""
-    return build_quote(body.option)
+    """Same as /api/itinerary/quote. Body: { \"option\": <option>, \"num_persons\": optional }."""
+    return build_quote(body.option, num_persons=body.num_persons)
 
 
 @app.post(

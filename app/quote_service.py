@@ -182,14 +182,16 @@ def _build_points_optimization(option: ItineraryOption, total: float) -> PointsO
     )
 
 
-def build_quote(option: ItineraryOption) -> QuoteResponse:
+def build_quote(option: ItineraryOption, num_persons: int | None = None) -> QuoteResponse:
     """
     Analyze the selected plan and return an in-depth quote:
     itemized breakdown, summary (subtotal + platform_fee = total), and points optimization.
+    num_persons: optional; used for per_person (default 2).
     """
     breakdown, subtotal = _build_breakdown(option)
     total = round(subtotal + PLATFORM_FEE, 2)
-    per_person = round(total / 2, 2)  # default 2 travelers; frontend can override with num_persons if added later
+    n = max(1, num_persons) if num_persons is not None else 2
+    per_person = round(total / n, 2)
 
     summary = QuoteSummary(
         subtotal=subtotal,
