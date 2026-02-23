@@ -1,6 +1,6 @@
 """
 Travel AI Backend — FastAPI app.
-Itinerary generation, flight tracking, destinations, quote, trip document.
+Itinerary generation, flight tracking, quote, trip document.
 """
 
 import os
@@ -12,10 +12,8 @@ load_dotenv()
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.destinations_service import get_destinations
 from app.flight_service import search_flights, track_flight
 from app.models import (
-    DestinationsResponse,
     FlightSearchRequest,
     FlightSearchResponse,
     FlightTrackRequest,
@@ -136,45 +134,6 @@ async def flights_search(body: FlightSearchRequest):
     """Same as /api/flights/search. Body: { \"origin\": \"Houston\", \"destination\": \"Tokyo\", \"date\": \"2026-03-15\" }."""
     return search_flights(origin=body.origin, destination=body.destination, date=body.date)
 
-
-# ----- Destinations (inspiration) -----
-
-
-@app.get(
-    "/api/destinations",
-    response_model=DestinationsResponse,
-    summary="List curated destinations",
-)
-async def destinations_api():
-    """Curated destinations for inspiration. Optional: seed from Hugging Face DeepNLP/travel-ai-agent via DESTINATIONS_USE_HF=1."""
-    return get_destinations(trending=False)
-
-
-@app.get(
-    "/destinations",
-    response_model=DestinationsResponse,
-    summary="List destinations (no prefix)",
-)
-async def destinations():
-    return get_destinations(trending=False)
-
-
-@app.get(
-    "/api/destinations/trending",
-    response_model=DestinationsResponse,
-    summary="Trending destinations",
-)
-async def destinations_trending_api():
-    return get_destinations(trending=True)
-
-
-@app.get(
-    "/destinations/trending",
-    response_model=DestinationsResponse,
-    summary="Trending destinations (no prefix)",
-)
-async def destinations_trending():
-    return get_destinations(trending=True)
 
 
 async def _generate(body: TripParams | None):

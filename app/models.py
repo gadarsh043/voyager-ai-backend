@@ -121,6 +121,9 @@ class Activity(BaseModel):
     name: Optional[str] = None  # e.g. pick label in plan-with-picks
     image_url: Optional[str] = None
     google_maps_url: Optional[str] = None
+    rating: Optional[float] = None          # Google Places rating (1–5)
+    user_ratings_total: Optional[int] = None  # number of Google reviews
+    description: Optional[str] = None       # editorial_summary or vicinity
 
 
 class DayPlan(BaseModel):

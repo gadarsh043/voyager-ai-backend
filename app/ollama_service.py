@@ -36,6 +36,7 @@ from app.models import (
     ItineraryOption,
     TripParams,
 )
+from app.places_service import PlaceInfo, fetch_destination_places
 
 OLLAMA_BASE = "http://localhost:11434"
 OLLAMA_CHAT = f"{OLLAMA_BASE}/api/chat"
@@ -60,80 +61,78 @@ def _default_trip_params() -> TripParams:
     )
 
 
-def _build_prompt(params: TripParams) -> tuple[str, str]:
+def _build_prompt(
+    params: TripParams,
+    places: list[PlaceInfo] | None = None,
+) -> tuple[str, str]:
+    """
+    Build Ollama prompt.
+    If `places` is provided, the place list is pre-partitioned into 3 non-overlapping
+    groups — one per option — so repeats across options are physically impossible.
+    Falls back to Ollama-recall mode if places is None/empty.
+    """
     p = params.model_dump(exclude_none=True)
     if not p:
         params = _default_trip_params()
         p = params.model_dump(exclude_none=True)
 
-    system = """You are a senior local travel planner with deep knowledge of destinations worldwide. Use YOUR TRAINING DATA and knowledge to suggest real, specific places—don't rely on generic lists.
+    # Compact JSON schema shared by both modes
+    schema = (
+        '{"suggested_days_for_trip":N,"options":['
+        '{"id":"opt_1","label":"Budget & local","daily_plan":{'
+        '"flight_from_source":{"from_location":"A","to_location":"B","start_time":"ISO","reach_by":"ISO"},'
+        '"flight_to_origin":{"from_location":"B","to_location":"A","start_time":"ISO","reach_by":"ISO"},'
+        '"hotel_stay":[{"name":"Hotel","check_in":"YYYY-MM-DD","check_out":"YYYY-MM-DD","image_url":"","google_maps_url":""}],'
+        '"days":[{"day":1,"activities":['
+        '{"start_from":"Hotel","name":"Place A","start_time":"09:00","reach_time":"10:30","time_to_spend":"1h 30m"},'
+        '{"start_from":"Place A","name":"Place B","start_time":"11:00","reach_time":"12:30","time_to_spend":"1h 30m"},'
+        '{"start_from":"Place B","name":"Place C","start_time":"14:00","reach_time":"17:00","time_to_spend":"3h"}'
+        ']}]},"total_estimated_cost":2000},'
+        '{"id":"opt_2",...},{"id":"opt_3",...}]}'
+    )
 
-You respond ONLY with valid JSON (no markdown, no code fences):
-{
-  "suggested_days_for_trip": 5,
-  "options": [
-    {
-      "id": "opt_1",
-      "label": "Short title (pace + cost level)",
-      "daily_plan": {
-        "flight_from_source": { "from_location": "XXX", "to_location": "YYY", "start_time": "ISO8601", "reach_by": "ISO8601" },
-        "flight_to_origin": { "from_location": "YYY", "to_location": "XXX", "start_time": "ISO8601", "reach_by": "ISO8601" },
-        "hotel_stay": [ { "name": "Hotel Name", "check_in": "YYYY-MM-DD", "check_out": "YYYY-MM-DD", "image_url": "", "google_maps_url": "" } ],
-        "days": [ { "day": 1, "activities": [ { "start_from": "...", "name": "Place A", "start_time": "09:00", "reach_time": "10:30", "time_to_spend": "1h 30m" }, { "start_from": "Place A", "name": "Place B", "start_time": "11:00", "reach_time": "12:30", "time_to_spend": "1h 30m" }, { "start_from": "Place B", "name": "Place C", "start_time": "14:00", "reach_time": "17:00", "time_to_spend": "3h" } ] } ]
-      },
-      "total_estimated_cost": 5500
-    },
-    { same for "opt_2" and "opt_3" }
-  ]
-}
+    if places:
+        # All 3 options share the full place pool.
+        # No-repeat is enforced *within* each option's days (same place can appear across different options).
+        place_lines = "\n".join(f"{i+1}. {pl.name}" for i, pl in enumerate(places))
+        prefs_str = ", ".join(params.preferences) if params.preferences else "none"
 
-MANDATORY – Multiple activities per day:
-- Each day must have 3 or 4 activities (e.g. morning, midday, afternoon, optional evening). Never output only 1 activity per day.
-- Space them realistically: start_time/reach_time in "HH:MM", time_to_spend like "1h 30m" or "2h". Chain start_from to the previous activity name.
+        system = (
+            "You are a travel scheduler. Arrange the provided places into daily itinerary options. "
+            "Return ONLY valid JSON matching this schema (no markdown, no extra text):\n" + schema
+        )
 
-CRITICAL – Use your knowledge:
-- Draw from your training data about the destination. Use REAL place names: actual museums, markets, neighborhoods, landmarks, restaurants, parks, day-trip towns.
-- For ANY destination, you know real places. Use them. Don't make up generic names.
-- If the destination is less common, use your general knowledge: real neighborhoods, markets, viewpoints, cultural sites that exist there.
+        user = f"""Trip: {params.origin or '?'} → {params.destination or '?'}
+Dates: {params.start_date or '?'} to {params.end_date or '?'} | Persons: {params.num_persons or 2} | Budget: ${params.per_person_budget or 1000}/person | Pace: {params.pace or 'moderate'} | Preferences: {prefs_str}
 
-MANDATORY – Preferences:
-- User preferences are REQUIRED. Match EVERY preference with real activities.
-- "shopping" → real markets, shopping streets, department stores, boutiques (use actual names).
-- "food" → real food markets, famous restaurants, food tours, street food areas.
-- "culture"/"history" → real museums, historic sites, temples, galleries.
-- "nature" → real parks, gardens, scenic spots, day trips to nature areas.
-- "nightlife" → real evening districts, bars, shows, entertainment areas.
-- Spread preferences across days; don't ignore any.
+Available places (all 3 options may draw from this same list):
+{place_lines}
 
-MANDATORY – No repeated places:
-- NEVER repeat the same place/attraction on two different days within the same option.
-- For 7 days with 3 activities/day = 21+ different places. Each day introduces NEW places only.
+Rules:
+- Create 3 options: opt_1 (budget/local theme), opt_2 (balanced highlights theme), opt_3 (premium experiences theme).
+- Each option: 3 activities per day chosen from the list above. Chain start_from to the previous place name (first activity of each day: start_from "Hotel").
+- Within each option, a place may only appear ONCE across all its days. Do not use the same place on two different days of the same option.
+- Each option should have a different character — vary the mix of restaurants, landmarks, parks, and experiences to match the theme.
+- Times in HH:MM. total_estimated_cost in USD (opt_1 cheapest, opt_3 most expensive).
+- suggested_days_for_trip: integer recommendation for this destination.
+- Return JSON only."""
 
-MANDATORY – Three truly different options:
-- opt_1: Different theme + different set of places (e.g. local markets, neighborhoods, budget spots).
-- opt_2: Different theme + different set of places (e.g. museums, landmarks, mid-range).
-- opt_3: Different theme + different set of places (e.g. day trips, premium experiences, luxury).
-- Vary neighborhoods, types of activities, and actual place names so each option feels like a different trip.
+    else:
+        # Fallback: no Places data, Ollama recalls places from training data
+        prefs_note = ""
+        if p.get("preferences"):
+            prefs_note = f" Preferences: {p['preferences']}. Match every preference with real activities."
 
-Other:
-- Flights/hotel: simple. Focus on places and daily flow.
-- Use real place names from your knowledge. No generic labels.
-- Cluster by neighborhood; include side trips (1–2 hr away) when they fit.
-- Times: "HH:MM", time_to_spend like "1h 30m". Costs: clearly different (budget/mid/luxury).
-"""
+        system = (
+            "You are a travel planner. Generate 3 itinerary options using REAL place names from your training data. "
+            "Return ONLY valid JSON matching this schema (no markdown):\n" + schema
+        )
 
-    prefs_note = ""
-    if p.get("preferences"):
-        prefs_note = f" IMPORTANT: User preferences are {p['preferences']}. You MUST include activities that match EVERY preference (e.g. shopping → markets/shops; food → food markets/restaurants; culture → museums/sites)."
-    user = f"""Generate exactly 3 itinerary options for this trip. Return only the JSON object, no other text.{prefs_note}
-
-Rules to follow:
-- Each day must have 3 or 4 activities (morning, midday, afternoon, optional evening). Do NOT output only one activity per day.
-- Every day in each option must list NEW places—never repeat an attraction on another day in that same option.
-- The 3 options must offer different sets of places and themes. Match the user's preferences with real activities.
-- Include "suggested_days_for_trip" at the root: your recommendation for how many days are sufficient for this destination (e.g. 4–5 for a city, 7 for a region with day trips).
-
-Trip parameters: {json.dumps(p, default=str)}"""
+        user = f"""Generate 3 itinerary options. Return JSON only.{prefs_note}
+- 3 activities per day. Chain start_from. No repeated places within the same option.
+- 3 options must use DIFFERENT sets of places and themes.
+- suggested_days_for_trip at root.
+Trip: {json.dumps(p, default=str)}"""
 
     return system, user
 
@@ -646,16 +645,39 @@ def _fallback_response(params: TripParams) -> ItineraryGenerateResponse:
 
 async def generate_itinerary(params: TripParams) -> ItineraryGenerateResponse:
     """
-    Call Ollama to generate 3 itinerary options. Raises ItineraryAPIError if Ollama
-    is unavailable, times out, or returns invalid JSON — so the frontend can show
-    "API failed" instead of generic fallback data.
+    Generate 3 itinerary options.
+
+    Pipeline:
+    1. Pre-fetch real places from Google Places API for the destination (fast, parallel queries).
+    2. Pass the place list to a short Ollama prompt — Ollama only schedules, not recalls.
+    3. If Places API returns nothing, fall back to Ollama-only recall mode (old behaviour).
+    Raises ItineraryAPIError on Ollama failure so the frontend shows a clear error.
     """
     if not any(params.model_dump().values()):
         params = _default_trip_params()
 
-    system, user = _build_prompt(params)
+    # Step 1: pre-fetch places (non-blocking; empty list = fallback mode)
+    places: list[PlaceInfo] = []
+    if params.destination:
+        try:
+            places = await fetch_destination_places(
+                destination=params.destination,
+                preferences=params.preferences,
+            )
+            if places:
+                import logging
+                logging.getLogger(__name__).info(
+                    "Places API: fetched %d places for %r", len(places), params.destination
+                )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Places pre-fetch failed: %s", exc)
+            places = []
+
+    # Step 2: build prompt (short if places available, verbose fallback otherwise)
+    system, user = _build_prompt(params, places=places if places else None)
+
     timeout_sec = _ollama_timeout_sec()
-    # Long read timeout so Ollama has time to generate; short connect timeout for fast fail if Ollama is down
     timeout_cfg = httpx.Timeout(10.0, read=timeout_sec)
 
     try:
@@ -671,9 +693,9 @@ async def generate_itinerary(params: TripParams) -> ItineraryGenerateResponse:
                     "stream": False,
                     "format": "json",
                     "options": {
-                        "temperature": 0.8,
+                        "temperature": 0.7,
                         "top_p": 0.9,
-                        "num_predict": 4000,
+                        "num_predict": 3500,
                     },
                 },
             )
@@ -685,16 +707,16 @@ async def generate_itinerary(params: TripParams) -> ItineraryGenerateResponse:
         )
     except httpx.TimeoutException:
         raise ItineraryAPIError(
-            f"Itinerary API failed: Ollama took longer than {int(timeout_sec)}s to respond. Try again or increase OLLAMA_TIMEOUT_SEC in .env (e.g. 900 for 15 min)."
+            f"Itinerary API failed: Ollama took longer than {int(timeout_sec)}s. Try again or increase OLLAMA_TIMEOUT_SEC."
         )
     except httpx.HTTPStatusError as e:
         body = (e.response.text or "")[:200]
         raise ItineraryAPIError(
-            f"Itinerary API failed: Ollama returned HTTP {e.response.status_code}. {body or 'Check that the model is pulled (ollama pull llama3.1:8b).'}"
+            f"Itinerary API failed: Ollama returned HTTP {e.response.status_code}. {body or 'Check that the model is pulled.'}"
         )
     except (httpx.HTTPError, Exception):
         raise ItineraryAPIError(
-            "Itinerary API failed: Ollama returned an error. Ensure Ollama is running and the model is pulled (e.g. `ollama pull llama3.1:8b`)."
+            "Itinerary API failed: Ollama returned an error. Ensure Ollama is running and the model is pulled."
         )
 
     content = (data.get("message") or {}).get("content") or ""
@@ -706,14 +728,32 @@ async def generate_itinerary(params: TripParams) -> ItineraryGenerateResponse:
             raw = json.loads(content)
         except json.JSONDecodeError:
             raise ItineraryAPIError(
-                "Itinerary API failed: Ollama returned invalid format. Try again or use a different model (e.g. OLLAMA_MODEL=llama3.1:8b)."
+                "Itinerary API failed: Ollama returned invalid JSON. Try again or switch model (set OLLAMA_MODEL=llama3.1:8b)."
             )
 
     num_days = _num_days(params.start_date or "2026-03-15", params.end_date or "2026-03-19")
     mapped = _map_to_response(raw, num_days_from_request=num_days)
     if mapped is None:
         raise ItineraryAPIError(
-            "Itinerary API failed: Ollama response could not be parsed into itinerary options. Try again or use a different model."
+            "Itinerary API failed: could not parse Ollama response into itinerary options. Try again."
         )
+
+    # Enrich activities with Places metadata (google_maps_url, rating, reviews, description)
+    if places:
+        places_map = {pl.name.lower(): pl for pl in places}
+        for opt in mapped.options:
+            for day in opt.daily_plan.days:
+                for act in day.activities:
+                    match = places_map.get((act.name or "").lower())
+                    if match:
+                        if not act.google_maps_url:
+                            act.google_maps_url = match.google_maps_url
+                        if act.rating is None and match.rating is not None:
+                            act.rating = match.rating
+                        if act.user_ratings_total is None and match.user_ratings_total is not None:
+                            act.user_ratings_total = match.user_ratings_total
+                        if not act.description and match.description:
+                            act.description = match.description
+
     _fill_placeholder_images(mapped, params)
     return mapped
