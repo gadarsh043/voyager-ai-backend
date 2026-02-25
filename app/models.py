@@ -111,6 +111,10 @@ class HotelStay(BaseModel):
     check_out: str
     image_url: Optional[str] = None
     google_maps_url: Optional[str] = None
+    price_level: Optional[int] = None       # Google Places price_level (0-4)
+    rating: Optional[float] = None
+    user_ratings_total: Optional[int] = None
+    description: Optional[str] = None
 
 
 class Activity(BaseModel):
@@ -124,11 +128,13 @@ class Activity(BaseModel):
     rating: Optional[float] = None          # Google Places rating (1–5)
     user_ratings_total: Optional[int] = None  # number of Google reviews
     description: Optional[str] = None       # editorial_summary or vicinity
+    price_level: Optional[int] = None       # Google Places price_level (0-4)
 
 
 class DayPlan(BaseModel):
     day: int
-    activities: list[Activity]
+    activities: list[Activity]          # Where to Go
+    places_to_eat: list[Activity] = []  # Where to Eat
 
 
 class DailyPlan(BaseModel):

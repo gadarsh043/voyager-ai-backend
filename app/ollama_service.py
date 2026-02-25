@@ -63,12 +63,11 @@ def _default_trip_params() -> TripParams:
 
 def _build_prompt(
     params: TripParams,
-    places: list[PlaceInfo] | None = None,
+    places: dict[str, list[PlaceInfo]] | None = None,
 ) -> tuple[str, str]:
     """
     Build Ollama prompt.
-    If `places` is provided, the place list is pre-partitioned into 3 non-overlapping
-    groups — one per option — so repeats across options are physically impossible.
+    If `places` is provided, it contains 'go', 'eat', and 'stay' keys.
     Falls back to Ollama-recall mode if places is None/empty.
     """
     p = params.model_dump(exclude_none=True)
@@ -85,37 +84,52 @@ def _build_prompt(
         '"hotel_stay":[{"name":"Hotel","check_in":"YYYY-MM-DD","check_out":"YYYY-MM-DD","image_url":"","google_maps_url":""}],'
         '"days":[{"day":1,"activities":['
         '{"start_from":"Hotel","name":"Place A","start_time":"09:00","reach_time":"10:30","time_to_spend":"1h 30m"},'
-        '{"start_from":"Place A","name":"Place B","start_time":"11:00","reach_time":"12:30","time_to_spend":"1h 30m"},'
-        '{"start_from":"Place B","name":"Place C","start_time":"14:00","reach_time":"17:00","time_to_spend":"3h"}'
+        '{"start_from":"Place A","name":"Place B","start_time":"11:00","reach_time":"12:30","time_to_spend":"1h 30m"}'
+        '],"places_to_eat":['
+        '{"start_from":"Place B","name":"Restaurant C","start_time":"13:00","reach_time":"14:00","time_to_spend":"1h"}'
         ']}]},"total_estimated_cost":2000},'
         '{"id":"opt_2",...},{"id":"opt_3",...}]}'
     )
 
-    if places:
-        # All 3 options share the full place pool.
-        # No-repeat is enforced *within* each option's days (same place can appear across different options).
-        place_lines = "\n".join(f"{i+1}. {pl.name}" for i, pl in enumerate(places))
+    if places and (places.get("go") or places.get("eat") or places.get("stay")):
+        # All 3 options share the place pools.
+        
+        def _format_places(plist: list[PlaceInfo]) -> str:
+            return "\n".join(f"- {pl.name}" + (f" (Price: {pl.price_level}/4)" if pl.price_level is not None else "") for pl in plist)
+
+        stay_lines = _format_places(places.get("stay", []))
+        go_lines = _format_places(places.get("go", []))
+        eat_lines = _format_places(places.get("eat", []))
         prefs_str = ", ".join(params.preferences) if params.preferences else "none"
 
         system = (
             "You are a travel scheduler. Arrange the provided places into daily itinerary options. "
-            "Return ONLY valid JSON matching this schema (no markdown, no extra text):\n" + schema
+            "Return ONLY valid JSON matching this schema exactly. Ensure all JSON objects and arrays are properly closed and do NOT include any markdown formatting like ```json:\n" + schema
         )
 
         user = f"""Trip: {params.origin or '?'} → {params.destination or '?'}
 Dates: {params.start_date or '?'} to {params.end_date or '?'} | Persons: {params.num_persons or 2} | Budget: ${params.per_person_budget or 1000}/person | Pace: {params.pace or 'moderate'} | Preferences: {prefs_str}
 
-Available places (all 3 options may draw from this same list):
-{place_lines}
+[Where to Stay]
+{stay_lines or 'Any local hotel'}
+
+[Where to Go]
+{go_lines or 'Any local attractions'}
+
+[Where to Eat]
+{eat_lines or 'Any local restaurants'}
 
 Rules:
 - Create 3 options: opt_1 (budget/local theme), opt_2 (balanced highlights theme), opt_3 (premium experiences theme).
-- Each option: 3 activities per day chosen from the list above. Chain start_from to the previous place name (first activity of each day: start_from "Hotel").
-- Within each option, a place may only appear ONCE across all its days. Do not use the same place on two different days of the same option.
-- Each option should have a different character — vary the mix of restaurants, landmarks, parks, and experiences to match the theme.
+- Put hotels exactly from [Where to Stay] into `hotel_stay`.
+- Put attractions exactly from [Where to Go] into `activities`. 
+- Put restaurants exactly from [Where to Eat] into `places_to_eat`.
+- Assign 2-3 `activities` and 1-2 `places_to_eat` per day.
+- Chain start_from dynamically.
+- Do not use the same place on two different days of the same option.
 - Times in HH:MM. total_estimated_cost in USD (opt_1 cheapest, opt_3 most expensive).
 - suggested_days_for_trip: integer recommendation for this destination.
-- Return JSON only."""
+- Return RAW JSON ONLY. No markdown formatted code blocks, no text before or after the JSON."""
 
     else:
         # Fallback: no Places data, Ollama recalls places from training data
@@ -138,15 +152,34 @@ Trip: {json.dumps(p, default=str)}"""
 
 
 def _extract_json(text: str) -> dict[str, Any] | None:
-    """Extract JSON from model output, stripping markdown code blocks if present."""
+    """Extract JSON from model output, stripping markdown code blocks and fixing common LLM syntax errors."""
     text = text.strip()
-    # Remove ```json ... ``` or ``` ... ```
+    
+    # Remove markdown formatting
     m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     if m:
         text = m.group(1).strip()
+    elif text.startswith("```"):
+        text = text.lstrip("`json\n").strip()
+    
+    # Strip any text before the first '{' and after the last '}'
+    start_idx = text.find("{")
+    end_idx = text.rfind("}")
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        text = text[start_idx:end_idx+1]
+        
+    # Attempt to fix trailing commas before } or ]
+    text = re.sub(r",\s*}", "}", text)
+    text = re.sub(r",\s*]", "]", text)
+    
+    # Remove common control characters that break parsing
+    text = text.replace("\x00", "").replace("\x0b", "").replace("\x0c", "").replace("\x1e", "")
+
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        import logging
+        logging.getLogger(__name__).error("Failed to parse Ollama JSON: %s. Raw text snippet: %r", e, text[:500])
         return None
 
 
@@ -194,37 +227,6 @@ def _placeholder_image_url(seed: str, width: int = 400, height: int = 300) -> st
 def _google_maps_url(query: str) -> str:
     """Google Maps search URL for a place name + location."""
     return f"https://www.google.com/maps/search/?api=1&query={quote_plus(query)}"
-
-
-def _fill_placeholder_images(response: ItineraryGenerateResponse, params: TripParams) -> None:
-    """Ensure at least one image_url and google_maps_url in the response (mutates in place)."""
-    dest = (params.destination or "destination").strip()
-    hotel_img = _placeholder_image_url(f"hotel_{dest}")
-    hotel_maps = _google_maps_url(f"Hotel {dest}")
-    activity_img = _placeholder_image_url(f"activity_{dest}")
-    activity_maps = _google_maps_url(f"Attractions {dest}")
-    filled_activity = False
-    for opt in response.options:
-        plan = opt.daily_plan
-        if plan.hotel_stay:
-            for stay in plan.hotel_stay:
-                if not stay.image_url:
-                    stay.image_url = hotel_img
-                if not stay.google_maps_url:
-                    stay.google_maps_url = hotel_maps
-        for day in plan.days:
-            for act in day.activities:
-                if not filled_activity and (not act.image_url or not act.google_maps_url):
-                    if not act.image_url:
-                        act.image_url = activity_img
-                    if not act.google_maps_url:
-                        act.google_maps_url = activity_maps
-                    filled_activity = True
-                    break
-            if filled_activity:
-                break
-        if filled_activity:
-            break
 
 
 def _preference_extras(destination: str, preferences: list[str] | None) -> list[str]:
@@ -541,9 +543,7 @@ def _fallback_response(params: TripParams) -> ItineraryGenerateResponse:
     end = params.end_date or "2026-03-19"
     num_days = _num_days(start, end)
 
-    hotel_image = _placeholder_image_url(f"hotel_{dest_display}")
     hotel_maps = _google_maps_url(f"Hotel {dest_display}")
-    activity_image = _placeholder_image_url(f"activity_{dest_display}")
     activity_maps = _google_maps_url(f"Attractions {dest_display}")
 
     budget_val: float = 3000.0
@@ -584,7 +584,7 @@ def _fallback_response(params: TripParams) -> ItineraryGenerateResponse:
                     reach_time=f"{rh:02d}:{rm:02d}",
                     time_to_spend=dur,
                     name=name,
-                    image_url=activity_image if d == 1 and i == 0 else None,
+                    image_url=None,
                     google_maps_url=activity_maps if d == 1 and i == 0 else None,
                 )
                 activities.append(act)
@@ -611,7 +611,7 @@ def _fallback_response(params: TripParams) -> ItineraryGenerateResponse:
                     name="Hotel",
                     check_in=start,
                     check_out=end,
-                    image_url=hotel_image,
+                    image_url=None,
                     google_maps_url=hotel_maps,
                 ),
             ],
@@ -656,23 +656,23 @@ async def generate_itinerary(params: TripParams) -> ItineraryGenerateResponse:
     if not any(params.model_dump().values()):
         params = _default_trip_params()
 
-    # Step 1: pre-fetch places (non-blocking; empty list = fallback mode)
-    places: list[PlaceInfo] = []
+    # Step 1: pre-fetch places (non-blocking; empty dict = fallback mode)
+    places: dict[str, list[PlaceInfo]] = {}
     if params.destination:
         try:
             places = await fetch_destination_places(
                 destination=params.destination,
                 preferences=params.preferences,
             )
-            if places:
+            if any(places.values()):
                 import logging
                 logging.getLogger(__name__).info(
-                    "Places API: fetched %d places for %r", len(places), params.destination
+                    "Places API: fetched categorized places for %r", params.destination
                 )
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("Places pre-fetch failed: %s", exc)
-            places = []
+            places = {}
 
     # Step 2: build prompt (short if places available, verbose fallback otherwise)
     system, user = _build_prompt(params, places=places if places else None)
@@ -695,7 +695,7 @@ async def generate_itinerary(params: TripParams) -> ItineraryGenerateResponse:
                     "options": {
                         "temperature": 0.7,
                         "top_p": 0.9,
-                        "num_predict": 3500,
+                        "num_predict": 8000,
                     },
                 },
             )
@@ -722,38 +722,80 @@ async def generate_itinerary(params: TripParams) -> ItineraryGenerateResponse:
     content = (data.get("message") or {}).get("content") or ""
     if isinstance(content, dict):
         content = json.dumps(content)
+        
     raw = _extract_json(content)
     if not raw:
-        try:
-            raw = json.loads(content)
-        except json.JSONDecodeError:
-            raise ItineraryAPIError(
-                "Itinerary API failed: Ollama returned invalid JSON. Try again or switch model (set OLLAMA_MODEL=llama3.1:8b)."
-            )
+        raise ItineraryAPIError(
+            "Itinerary generation failed: Ollama returned invalid JSON. Please click Generate again to retry."
+        )
 
     num_days = _num_days(params.start_date or "2026-03-15", params.end_date or "2026-03-19")
     mapped = _map_to_response(raw, num_days_from_request=num_days)
     if mapped is None:
         raise ItineraryAPIError(
-            "Itinerary API failed: could not parse Ollama response into itinerary options. Try again."
+            "Itinerary generation failed: Could not parse Ollama response into exact itinerary options. Please click Generate again to retry."
         )
 
-    # Enrich activities with Places metadata (google_maps_url, rating, reviews, description)
+    # Enrich activities/hotels with Places metadata (google_maps_url, rating, reviews, description, price_level)
     if places:
-        places_map = {pl.name.lower(): pl for pl in places}
+        # Flatten all fetched places into one map by name
+        flat_places = places.get("go", []) + places.get("eat", []) + places.get("stay", [])
+        places_map = {pl.name.lower(): pl for pl in flat_places}
+        
         for opt in mapped.options:
-            for day in opt.daily_plan.days:
+            plan = opt.daily_plan
+            
+            # Enrich hotel stays
+            if plan.hotel_stay:
+                for stay in plan.hotel_stay:
+                    match = places_map.get((stay.name or "").lower())
+                    if match:
+                        if not stay.google_maps_url:
+                            stay.google_maps_url = match.google_maps_url
+                        if not stay.image_url and match.image_url:
+                            stay.image_url = match.image_url
+                        if stay.rating is None and match.rating is not None:
+                            stay.rating = match.rating
+                        if stay.user_ratings_total is None and match.user_ratings_total is not None:
+                            stay.user_ratings_total = match.user_ratings_total
+                        if not stay.description and match.description:
+                            stay.description = match.description
+                        if stay.price_level is None and match.price_level is not None:
+                            stay.price_level = match.price_level
+                            
+            for day in plan.days:
+                # Enrich Where to Go
                 for act in day.activities:
                     match = places_map.get((act.name or "").lower())
                     if match:
                         if not act.google_maps_url:
                             act.google_maps_url = match.google_maps_url
+                        if not act.image_url and match.image_url:
+                            act.image_url = match.image_url
                         if act.rating is None and match.rating is not None:
                             act.rating = match.rating
                         if act.user_ratings_total is None and match.user_ratings_total is not None:
                             act.user_ratings_total = match.user_ratings_total
                         if not act.description and match.description:
                             act.description = match.description
+                        if act.price_level is None and match.price_level is not None:
+                            act.price_level = match.price_level
+                            
+                # Enrich Where to Eat
+                for eat in day.places_to_eat:
+                    match = places_map.get((eat.name or "").lower())
+                    if match:
+                        if not eat.google_maps_url:
+                            eat.google_maps_url = match.google_maps_url
+                        if not eat.image_url and match.image_url:
+                            eat.image_url = match.image_url
+                        if eat.rating is None and match.rating is not None:
+                            eat.rating = match.rating
+                        if eat.user_ratings_total is None and match.user_ratings_total is not None:
+                            eat.user_ratings_total = match.user_ratings_total
+                        if not eat.description and match.description:
+                            eat.description = match.description
+                        if eat.price_level is None and match.price_level is not None:
+                            eat.price_level = match.price_level
 
-    _fill_placeholder_images(mapped, params)
     return mapped

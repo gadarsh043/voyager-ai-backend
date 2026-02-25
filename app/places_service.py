@@ -32,7 +32,8 @@ class PlaceInfo:
     rating: Optional[float] = None
     user_ratings_total: Optional[int] = None
     description: Optional[str] = None  # editorial_summary or vicinity
-
+    price_level: Optional[int] = None
+    image_url: Optional[str] = None
 
 def _maps_url(place_id: str) -> str:
     return f"https://www.google.com/maps/place/?q=place_id:{place_id}"
@@ -120,6 +121,16 @@ async def _text_search(
         types = item.get("types") or []
         rating = item.get("rating")
         user_ratings_total = item.get("user_ratings_total")
+        price_level = item.get("price_level")
+        
+        # Grab the first photo
+        photos = item.get("photos", [])
+        image_url = None
+        if photos and isinstance(photos, list) and len(photos) > 0:
+            photo_ref = photos[0].get("photo_reference")
+            if photo_ref:
+                image_url = f"https://maps.googleapis.com/maps/api/place/photo?maxwidth=800&photo_reference={photo_ref}&key={api_key}"
+
         # editorial_summary (Details-only) and vicinity rarely populate in Text Search;
         # fall back to a human-readable label derived from the place's type tags
         editorial = (item.get("editorial_summary") or {}).get("overview", "")
@@ -133,57 +144,54 @@ async def _text_search(
                 rating=rating,
                 user_ratings_total=user_ratings_total,
                 description=description,
+                price_level=price_level,
+                image_url=image_url,
             )
         )
     return places
 
 
-def _build_queries(destination: str, preferences: list[str] | None) -> list[tuple[str, Optional[str]]]:
+def _build_queries_categorized(destination: str, preferences: list[str] | None) -> dict[str, list[tuple[str, Optional[str]]]]:
     """
-    Return (query, optional_place_type) tuples to run in parallel.
-    Run many varied queries to ensure we get 90+ distinct places.
+    Build structured queries mapped to exactly 3 categories (go, eat, stay).
+    Limits redundant calls but gets enough distinct places to feed Ollama schemas.
     """
     d = destination.strip()
-    queries: list[tuple[str, Optional[str]]] = [
-        # Core tourist & landmark
+    prefs = [p.lower() for p in (preferences or [])]
+
+    # Where to Go
+    go_queries: list[tuple[str, Optional[str]]] = [
         (f"top tourist attractions in {d}", "tourist_attraction"),
-        (f"famous landmarks in {d}", "tourist_attraction"),
-        (f"hidden gems and local spots in {d}", "tourist_attraction"),
-        (f"museums and galleries in {d}", "museum"),
-        (f"parks and gardens in {d}", "park"),
-        (f"historic sites in {d}", None),
-        # Food & drink (get lots of variety)
+        (f"famous landmarks and historic sites in {d}", None),
+        (f"hidden gems and parks in {d}", "park"),
+        (f"museums and art galleries in {d}", "museum"),
+        (f"things to do and experiences in {d}", None)
+    ]
+    if "shopping" in prefs:
+        go_queries.append((f"best shopping markets and malls in {d}", "shopping_mall"))
+    if "nightlife" in prefs:
+        go_queries.append((f"nightlife districts bars clubs in {d}", "night_club"))
+    if "nature" in prefs:
+        go_queries.append((f"nature hikes scenic spots near {d}", None))
+
+    # Where to Eat
+    eat_queries: list[tuple[str, Optional[str]]] = [
         (f"best restaurants in {d}", "restaurant"),
         (f"local food markets and street food in {d}", "restaurant"),
-        (f"cafes and coffee shops in {d}", "cafe"),
-        (f"rooftop bars and lounges in {d}", "bar"),
-        # Entertainment & experience
-        (f"things to do in {d}", None),
-        (f"entertainment and activities in {d}", None),
-        (f"viewpoints and observation decks in {d}", None),
-        # Broader radius — nearby day trips
-        (f"day trips from {d} within 100 miles", "tourist_attraction"),
-        (f"nearby attractions 100 miles from {d}", None),
+        (f"top cafes and bakeries in {d}", "cafe"),
+        (f"casual lunch spots in {d}", "restaurant"),
+    ]
+    if "food" in prefs:
+        eat_queries.append((f"michelin star or fine dining in {d}", "restaurant"))
+
+    # Where to Stay
+    stay_queries: list[tuple[str, Optional[str]]] = [
+        (f"top rated hotels in {d}", "lodging"),
+        (f"best places to stay in {d}", "lodging"),
+        (f"boutique hotels and resorts in {d}", "lodging")
     ]
 
-    prefs = [p.lower() for p in (preferences or [])]
-    if "shopping" in prefs:
-        queries.append((f"best shopping markets and malls in {d}", "shopping_mall"))
-        queries.append((f"vintage markets and boutiques in {d}", None))
-    if "nightlife" in prefs:
-        queries.append((f"nightlife districts bars clubs in {d}", "night_club"))
-    if "nature" in prefs:
-        queries.append((f"nature hikes scenic spots in {d}", None))
-        queries.append((f"beaches or lakes near {d}", None))
-    if "history" in prefs or "culture" in prefs:
-        queries.append((f"historical heritage neighborhoods in {d}", None))
-        queries.append((f"cultural centers and art districts in {d}", None))
-    if "food" in prefs:
-        queries.append((f"famous food tours and cooking classes in {d}", None))
-        queries.append((f"michelin star restaurants near {d}", "restaurant"))
-
-    return queries
-
+    return {"go": go_queries, "eat": eat_queries, "stay": stay_queries}
 
 def _deduplicate(places: list[PlaceInfo]) -> list[PlaceInfo]:
     """Deduplicate by lowercased name; keep highest-rated duplicate."""
@@ -230,33 +238,38 @@ def partition_places(places: list[PlaceInfo]) -> tuple[list[PlaceInfo], list[Pla
 async def fetch_destination_places(
     destination: str,
     preferences: list[str] | None = None,
-) -> list[PlaceInfo]:
+) -> dict[str, list[PlaceInfo]]:
     """
     Fetch real places for a destination using Google Places Text Search.
-    Returns up to MAX_PLACES deduplicated, sorted places.
-    Falls back to empty list on any error (Ollama will generate without hints).
+    Returns categorized dictionary: "go", "eat", and "stay".
     """
+    empty_dict = {"go": [], "eat": [], "stay": []}
     api_key = _get_api_key()
     if not api_key:
         logger.info("GOOGLE_MAPS_API_KEY not set; skipping Places pre-fetch")
-        return []
+        return empty_dict
 
     if not destination or not destination.strip():
-        return []
+        return empty_dict
 
-    queries = _build_queries(destination.strip(), preferences)
+    queries_by_cat = _build_queries_categorized(destination.strip(), preferences)
+    results_by_cat: dict[str, list[PlaceInfo]] = empty_dict.copy()
 
     async with httpx.AsyncClient() as client:
-        tasks = [_text_search(client, q, api_key, ptype) for q, ptype in queries]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for cat, queries in queries_by_cat.items():
+            tasks = [_text_search(client, q, api_key, ptype) for q, ptype in queries]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            all_places: list[PlaceInfo] = []
+            for r in results:
+                if isinstance(r, list):
+                    all_places.extend(r)
+            
+            unique = _deduplicate(all_places)
+            ranked = _sort_by_relevance(unique)
+            # Cap top per category (50 for go, 30 for eat, 15 for stay)
+            cap = 50 if cat == "go" else (30 if cat == "eat" else 15)
+            results_by_cat[cat] = ranked[:cap]
+            logger.info("Places API: %d unique places fetched for %r in category %r", len(results_by_cat[cat]), destination, cat)
 
-    all_places: list[PlaceInfo] = []
-    for r in results:
-        if isinstance(r, list):
-            all_places.extend(r)
-
-    unique = _deduplicate(all_places)
-    ranked = _sort_by_relevance(unique)
-    total = ranked[:MAX_PLACES]
-    logger.info("Places API: %d unique places fetched for %r", len(total), destination)
-    return total
+    return results_by_cat
